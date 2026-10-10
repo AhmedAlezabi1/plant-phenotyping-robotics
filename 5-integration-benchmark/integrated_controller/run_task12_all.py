@@ -15,7 +15,7 @@ Ties everything together:
 Usage:
   python run_task12_all.py
 
-Author: Ahmed (245226)
+Author: Ahmed Ali Alezabi
 """
 
 import sys

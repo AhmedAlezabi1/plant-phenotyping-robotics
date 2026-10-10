@@ -14,7 +14,7 @@ Saves results to CSV and generates benchmark plots.
 Usage:
     python task13_benchmark.py
 
-Author: Ahmed (245226)
+Author: Ahmed Ali Alezabi
 """
 
 import sys

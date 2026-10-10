@@ -1,6 +1,6 @@
 # Task 12: System Integration
 
-**Student:** Ahmed (245226)  
+**Author:** Ahmed Ali Alezabi  
 **Controller Used:** PID (from Task 10)  
 **Model Used:** Residual U-Net, 192px patches (from Task 5)
 
