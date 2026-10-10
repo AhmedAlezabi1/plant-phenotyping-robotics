@@ -1,0 +1,489 @@
+from __future__ import annotations
+
+"""
+Train a PPO reinforcement learning model locally or using ClearML workers.
+
+This script:
+- Can enqueue a job to ClearML or run locally.
+- Ensures worker dependencies are installed correctly.
+- Supports resuming from a ClearML artifact.
+- Saves checkpoints and optionally uploads them to ClearML.
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+import shutil
+import gc
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+
+THIS_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = THIS_DIR.parent
+
+
+def _is_worker() -> bool:
+    """Return True if the script is running inside a ClearML worker environment."""
+    return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"))
+
+
+def _pip_install(cmd: list[str]) -> None:
+    """Run a pip command and stop the program if the install fails."""
+    print("[pip]", " ".join(cmd))
+    subprocess.check_call(cmd)
+
+
+def _restart_self() -> None:
+    """Restart the current Python process with the same command line arguments."""
+    print("[restart] Restarting process ...")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _cleanup_memory(tag: str = "") -> None:
+    """Try to free memory (Python GC and CUDA cache if torch is available)."""
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    if tag:
+        print(f"[mem] cleanup done: {tag}")
+
+
+def round_up_to_multiple(x: int, m: int) -> int:
+    """Round x up to the nearest multiple of m."""
+    x = int(x)
+    m = int(m)
+    return int(((x + m - 1) // m) * m)
+
+
+def parse_args():
+    """Read and return all command line arguments for training and ClearML options."""
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--use_clearml", action="store_true", help="Enqueue training remotely via ClearML")
+    p.add_argument("--project_name", type=str, default="Mentor Group - Alican/Group 1")
+    p.add_argument("--task_name", type=str, default="OT2_PPO_Train")
+    p.add_argument("--queue", type=str, default="default")
+    p.add_argument("--docker", type=str, default="deanis/2023y2b-rl:latest")
+
+    p.add_argument("--run_name", type=str, default="", help="models/<run_name>/...")
+    p.add_argument("--seed", type=int, default=0)
+
+    p.add_argument("--max_steps", type=int, default=400)
+    p.add_argument("--success_threshold", type=float, default=0.03)
+    p.add_argument("--action_repeat", type=int, default=1)
+    p.add_argument("--vel_max", type=float, default=0.3)
+    p.add_argument(
+        "--near_goal_slowdown",
+        type=lambda s: str(s).lower() in ("1", "true", "yes", "y", "t"),
+        default=False,
+        help="true/false",
+    )
+    p.add_argument("--render", action="store_true", help="GUI render (avoid on workers)")
+
+    p.add_argument("--learning_rate", type=float, default=3e-4)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--n_steps", type=int, default=512)
+    p.add_argument("--n_epochs", type=int, default=5)
+    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--clip_range", type=float, default=0.2)
+    p.add_argument("--ent_coef", type=float, default=0.0)
+
+    p.add_argument("--target_kl", type=float, default=None, help="Recommended 0.02 for fine-tuning stability")
+
+    p.add_argument("--total_timesteps", type=int, default=800_000)
+    p.add_argument("--checkpoint_freq", type=int, default=102_400)
+
+    p.add_argument("--resume_task_id", type=str, default="", help="ClearML task id to resume from")
+    p.add_argument("--resume_artifact", type=str, default="ppo_final_model", help="Artifact name")
+    p.add_argument("--reset_timesteps", action="store_true", help="Reset SB3 timestep counter")
+
+    p.add_argument("--upload_checkpoints", action="store_true")
+    p.add_argument("--upload_every_n_checkpoints", type=int, default=1)
+    p.add_argument("--upload_final", action="store_true")
+    p.add_argument("--upload_run_zip", action="store_true")
+    p.set_defaults(upload_checkpoints=False, upload_final=True, upload_run_zip=False)
+
+    return p.parse_args()
+
+
+def _get_task():
+    """Return the current ClearML task if available, otherwise return None."""
+    try:
+        from clearml import Task
+        t = Task.current_task()
+        if t is None:
+            tid = os.environ.get("CLEARML_TASK_ID")
+            if tid:
+                t = Task.get_task(task_id=tid)
+        return t
+    except Exception:
+        return None
+
+
+def clearml_setup_and_exit_if_local(args) -> Optional[str]:
+    """Set up ClearML and enqueue remotely when running locally, or attach when on a worker."""
+    if not args.use_clearml and not _is_worker():
+        return None
+
+    from clearml import Task
+
+    if _is_worker():
+        task = _get_task()
+        if task:
+            task.connect(vars(args), name="cli_args")
+            print("[ClearML] Worker attached:", task.id)
+            return task.id
+        print("[ClearML] Worker detected but no task attached")
+        return None
+
+    task = Task.init(project_name=args.project_name, task_name=args.task_name)
+    task.connect(vars(args), name="cli_args")
+    task.set_base_docker(args.docker)
+
+    print("[ClearML] Enqueuing to queue:", args.queue)
+    task.execute_remotely(queue_name=args.queue)
+    raise SystemExit(0)
+
+
+def ensure_cpu_torch_on_worker() -> None:
+    """On a ClearML worker, ensure CPU-only torch is installed, then restart if changed."""
+    if not _is_worker():
+        return
+
+    need_install = False
+    try:
+        import torch as _t
+        if _t.version.cuda is not None:
+            print("[torch-check] CUDA torch detected:", _t.__version__, "cuda:", _t.version.cuda)
+            need_install = True
+    except Exception as e:
+        print("[torch-check] torch import failed:", repr(e))
+        need_install = True
+
+    if not need_install:
+        print("[torch-check] CPU torch already OK")
+        return
+
+    print("[FIX] Installing CPU-only torch ...")
+    _pip_install(
+        [
+            sys.executable, "-m", "pip", "install",
+            "--no-cache-dir", "--force-reinstall", "--upgrade",
+            "--index-url", "https://download.pytorch.org/whl/cpu",
+            "torch==2.4.1+cpu",
+        ]
+    )
+    _restart_self()
+
+
+def ensure_pybullet_on_worker() -> None:
+    """On a ClearML worker, ensure pybullet is installed, then restart if changed."""
+    if not _is_worker():
+        return
+
+    try:
+        import pybullet
+        import pybullet_data
+        print("[pybullet-check] pybullet OK")
+        return
+    except Exception as e:
+        print("[pybullet-check] missing:", repr(e))
+
+    print("[FIX] Installing pybullet on worker...")
+    _pip_install(
+        [
+            sys.executable, "-m", "pip", "install",
+            "--no-cache-dir", "--upgrade",
+            "pybullet==3.2.6",
+        ]
+    )
+    _restart_self()
+
+
+def resolve_resume_local_path(args) -> str:
+    """If resume settings are provided, download the model artifact locally and return its path."""
+    if not args.resume_task_id:
+        return ""
+    from clearml import Task
+    t = Task.get_task(task_id=args.resume_task_id)
+
+    if args.resume_artifact not in t.artifacts:
+        raise RuntimeError(
+            f"Artifact '{args.resume_artifact}' not found in task {args.resume_task_id}. "
+            f"Available: {list(t.artifacts.keys())}"
+        )
+
+    local_path = t.artifacts[args.resume_artifact].get_local_copy()
+    print("[resume] Pulled model artifact to:", local_path)
+    return local_path
+
+
+def upload_artifact(name: str, filepath: str) -> None:
+    """Upload a file to the current ClearML task as an artifact, if a task exists."""
+    try:
+        task = _get_task()
+        if task is None:
+            print(f"[upload] No ClearML task; skipping {name}")
+            return
+        if not filepath or not os.path.exists(filepath):
+            print(f"[upload] Missing file for {name}: {filepath}")
+            return
+
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        print(f"[ClearML] Uploading artifact: {name} -> {filepath} ({size_mb:.2f} MB)")
+        task.upload_artifact(name=name, artifact_object=filepath, wait_on_upload=True)
+        try:
+            task.flush(wait_for_uploads=True)
+        except Exception:
+            pass
+        _cleanup_memory(tag=f"after upload {name}")
+    except Exception as e:
+        print(f"[upload] FAILED {name}: {e}")
+
+
+def main():
+    """Main entry point: set up environment, create/load model, train, save, and upload artifacts."""
+    args = parse_args()
+
+    os.chdir(str(PROJECT_ROOT))
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+    current_task_id = clearml_setup_and_exit_if_local(args)
+
+    ensure_cpu_torch_on_worker()
+    ensure_pybullet_on_worker()
+
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.callbacks import BaseCallback
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+    from stable_baselines3.common.utils import get_schedule_fn
+
+    from envs.ot2_gym_wrapper import OT2GymEnv
+
+    class ClearMLScalarCallback(BaseCallback):
+        """Report basic training scalars (timesteps, reward estimate, success rate) to ClearML."""
+
+        def __init__(self, report_every_steps: int):
+            """Store reporting frequency and initialize tracking variables."""
+            super().__init__()
+            self.report_every_steps = int(report_every_steps)
+            self._logger = None
+            self._ep_return = 0.0
+            self._ep_returns: list[float] = []
+            self._episodes = 0
+            self._successes = 0
+
+        def _on_training_start(self) -> None:
+            """Attach a ClearML logger (if available) when training starts."""
+            try:
+                task = _get_task()
+                self._logger = task.get_logger() if task else None
+                print("[ClearML] scalar logger attached:", bool(self._logger))
+            except Exception as e:
+                self._logger = None
+                print("[ClearML] scalar logger attach failed:", repr(e))
+
+        def _on_step(self) -> bool:
+            """Collect per-step rewards and report summary values every N steps."""
+            reward = float(self.locals["rewards"][0])
+            done = bool(self.locals["dones"][0])
+            info = self.locals["infos"][0] if self.locals.get("infos") else {}
+
+            self._ep_return += reward
+            if done:
+                self._episodes += 1
+                self._ep_returns.append(self._ep_return)
+                if bool(info.get("is_success", False)):
+                    self._successes += 1
+                self._ep_return = 0.0
+
+            if self._logger and (self.num_timesteps % self.report_every_steps == 0):
+                it = int(self.num_timesteps)
+                window = 50
+                recent = self._ep_returns[-window:] if self._ep_returns else []
+                ep_rew_mean_est = (sum(recent) / len(recent)) if recent else 0.0
+                success_rate_est = (self._successes / self._episodes) if self._episodes > 0 else 0.0
+
+                self._logger.report_scalar("time", "timesteps", it, iteration=it)
+                self._logger.report_scalar("rollout", "ep_rew_mean_est", ep_rew_mean_est, iteration=it)
+                self._logger.report_scalar("rollout", "success_rate_est", success_rate_est, iteration=it)
+
+            return True
+
+    if not args.run_name:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.run_name = f"ot2_run_{stamp}"
+
+    rollout = int(args.n_steps)
+    args.total_timesteps = round_up_to_multiple(args.total_timesteps, rollout)
+    args.checkpoint_freq = round_up_to_multiple(args.checkpoint_freq, rollout)
+
+    model_root = PROJECT_ROOT / "models" / args.run_name
+    model_root.mkdir(parents=True, exist_ok=True)
+
+    total = int(args.total_timesteps)
+    chunk = int(args.checkpoint_freq) if int(args.checkpoint_freq) > 0 else total
+
+    def make_vec_env() -> VecMonitor:
+        """Create and return a vectorized OT2Gym environment wrapped with monitoring."""
+        def _make():
+            """Create a single OT2Gym environment instance with the selected settings."""
+            return OT2GymEnv(
+                render=args.render,
+                max_steps=args.max_steps,
+                success_threshold=args.success_threshold,
+                seed=args.seed,
+                debug=False,
+                action_repeat=args.action_repeat,
+                vel_max=args.vel_max,
+                near_goal_slowdown=args.near_goal_slowdown,
+            )
+        return VecMonitor(DummyVecEnv([_make]))
+
+    def safe_close(vec_env) -> None:
+        """Safely close the environment and try to free memory."""
+        try:
+            if vec_env is not None:
+                vec_env.close()
+        except Exception:
+            pass
+        _cleanup_memory(tag="after env.close()")
+
+    resume_local = resolve_resume_local_path(args)
+
+    print("\nTRAINING CONFIG")
+    print("Worker:", _is_worker())
+    print("ClearML task id:", current_task_id if current_task_id else "(none)")
+    print("Run name:", args.run_name)
+    print("Total timesteps (rounded):", total)
+    print("Checkpoint freq (rounded):", chunk)
+    print(
+        "PPO: n_steps=", args.n_steps,
+        "batch=", args.batch_size,
+        "epochs=", args.n_epochs,
+        "lr=", args.learning_rate,
+        "gamma=", args.gamma,
+        "clip_range=", args.clip_range,
+        "ent_coef=", args.ent_coef,
+        "target_kl=", args.target_kl,
+    )
+    print(
+        "Env: max_steps=", args.max_steps,
+        "thr=", args.success_threshold,
+        "vel_max=", args.vel_max,
+        "slowdown=", args.near_goal_slowdown,
+        "action_repeat=", args.action_repeat,
+    )
+    print("Resume model:", resume_local if resume_local else "(none)")
+    print("Save dir:", str(model_root))
+    
+
+    vec_env = make_vec_env()
+
+    if resume_local:
+        print("[resume] Loading PPO from:", resume_local)
+        model = PPO.load(resume_local, env=vec_env, device="cpu")
+
+        model.learning_rate = get_schedule_fn(float(args.learning_rate))
+        model.clip_range = get_schedule_fn(float(args.clip_range))
+
+        model.ent_coef = float(args.ent_coef)
+        model.n_epochs = int(args.n_epochs)
+        model.batch_size = int(args.batch_size)
+
+        if args.target_kl is not None:
+            model.target_kl = float(args.target_kl)
+
+        print(
+            "[resume] Overriding hyperparams:",
+            "lr=", args.learning_rate,
+            "ent_coef=", args.ent_coef,
+            "clip_range=", args.clip_range,
+            "n_epochs=", args.n_epochs,
+            "batch_size=", args.batch_size,
+            "target_kl=", args.target_kl,
+        )
+    else:
+        model = PPO(
+            "MlpPolicy",
+            vec_env,
+            verbose=1,
+            learning_rate=args.learning_rate,
+            batch_size=args.batch_size,
+            n_steps=args.n_steps,
+            n_epochs=args.n_epochs,
+            gamma=args.gamma,
+            clip_range=args.clip_range,
+            ent_coef=args.ent_coef,
+            target_kl=args.target_kl,
+            device="cpu",
+        )
+
+    cb = ClearMLScalarCallback(report_every_steps=max(256, int(args.n_steps)))
+
+    trained = 0
+    ckpt_index = 0
+
+    while trained < total:
+        this_chunk = min(chunk, total - trained)
+
+        model.learn(
+            total_timesteps=this_chunk,
+            progress_bar=not _is_worker(),
+            reset_num_timesteps=bool(args.reset_timesteps),
+            callback=cb,
+        )
+        args.reset_timesteps = False
+
+        trained += this_chunk
+        ckpt_index += 1
+
+        ckpt_base = model_root / f"ppo_ot2_{trained}_steps"
+        ckpt_zip = str(ckpt_base) + ".zip"
+
+        print("[save] checkpoint:", str(ckpt_base))
+        model.save(str(ckpt_base))
+
+        if args.upload_checkpoints and (ckpt_index % max(1, int(args.upload_every_n_checkpoints)) == 0):
+            upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=ckpt_zip)
+
+        _cleanup_memory(tag=f"after save {trained}")
+
+    final_base = model_root / "ppo_ot2_final"
+    final_zip = str(final_base) + ".zip"
+    model.save(str(final_base))
+
+    print("Training finished successfully.")
+    print("Saved to:", str(final_base))
+
+    safe_close(vec_env)
+
+    if args.upload_final:
+        upload_artifact(name="ppo_final_model", filepath=final_zip)
+
+    if args.upload_run_zip:
+        try:
+            zip_base = PROJECT_ROOT / "models" / args.run_name
+            zip_file = shutil.make_archive(base_name=str(zip_base), format="zip", root_dir=str(model_root))
+            upload_artifact(name="run_folder_zip", filepath=zip_file)
+        except Exception as e:
+            print("[zip] FAILED:", e)
+
+    _cleanup_memory(tag="final")
+
+
+if __name__ == "__main__":
+    main()
